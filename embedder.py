@@ -1,8 +1,29 @@
 import uuid
+from pathlib import Path
 
 import chromadb
 from sentence_transformers import SentenceTransformer
 from config import EMBED_MODEL, CHROMA_DIR, COLLECTION_NAME
+
+
+def persistent_chroma_client():
+    """
+    Local on-disk Chroma client. If you see 'default_tenant', the chroma_db folder
+    is usually from another Chroma version or corrupt — delete it and rebuild the index.
+    """
+    path = str(Path(CHROMA_DIR).resolve())
+    try:
+        return chromadb.PersistentClient(path=path)
+    except Exception as e:
+        err = str(e).lower()
+        if "tenant" in err or "default_tenant" in str(e):
+            raise RuntimeError(
+                "ChromaDB could not open its local database (tenant error). The folder "
+                f"{CHROMA_DIR!r} was likely built with a different ChromaDB version or is corrupt.\n\n"
+                "Fix: stop the app, delete that folder, then start again so the index rebuilds "
+                "(e.g. rm -rf chroma_db). With the CLI, run python main.py and type reindex if needed."
+            ) from e
+        raise
 
 
 def get_embed_model() -> SentenceTransformer:
@@ -18,7 +39,7 @@ def build_index(records: list[dict], embed_model: SentenceTransformer) -> chroma
     """
     print(f"[embedder] Building index for {len(records)} records...")
 
-    client     = chromadb.PersistentClient(path=CHROMA_DIR)
+    client = persistent_chroma_client()
 
     # Drop existing collection so we start fresh
     try:
@@ -95,7 +116,7 @@ def load_index(embed_model: SentenceTransformer) -> chromadb.Collection:
     """
     Loads an existing ChromaDB collection without rebuilding.
     """
-    client     = chromadb.PersistentClient(path=CHROMA_DIR)
+    client = persistent_chroma_client()
     collection = client.get_collection(COLLECTION_NAME)
     print(f"[embedder] Loaded existing index — {collection.count()} documents")
     return collection
