@@ -1,3 +1,5 @@
+import uuid
+
 import chromadb
 from sentence_transformers import SentenceTransformer
 from config import EMBED_MODEL, CHROMA_DIR, COLLECTION_NAME
@@ -52,6 +54,41 @@ def build_index(records: list[dict], embed_model: SentenceTransformer) -> chroma
 
     print(f"[embedder] Indexed {len(records)} documents into ChromaDB at '{CHROMA_DIR}'")
     return collection
+
+
+def append_to_collection(
+    collection: chromadb.Collection,
+    records: list[dict],
+    embed_model: SentenceTransformer,
+    id_prefix: str = "sup",
+) -> int:
+    """
+    Embed and add new FAQ rows without rebuilding the index.
+    Each record must have document, question, answer, sheet (as returned by preprocess).
+    """
+    if not records:
+        return 0
+    documents = [r["document"] for r in records]
+    metadatas = [
+        {"question": r["question"], "answer": r["answer"], "sheet": r["sheet"]}
+        for r in records
+    ]
+    ids = [f"{id_prefix}_{uuid.uuid4().hex}" for _ in records]
+    batch_size = 64
+    all_embeddings: list = []
+    for i in range(0, len(documents), batch_size):
+        batch = documents[i : i + batch_size]
+        all_embeddings.extend(
+            embed_model.encode(batch, show_progress_bar=False).tolist()
+        )
+    collection.add(
+        ids=ids,
+        documents=documents,
+        embeddings=all_embeddings,
+        metadatas=metadatas,
+    )
+    print(f"[embedder] Appended {len(records)} documents to collection '{COLLECTION_NAME}'")
+    return len(records)
 
 
 def load_index(embed_model: SentenceTransformer) -> chromadb.Collection:

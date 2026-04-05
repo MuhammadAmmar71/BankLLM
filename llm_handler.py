@@ -1,110 +1,94 @@
 import os
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from config import LLM_MODEL, MODE, MAX_NEW_TOKENS, REPETITION_PENALTY, SYSTEM_PROMPT, HF_TOKEN
+
+from openai import OpenAI
+
+from config import (
+    MAX_NEW_TOKENS,
+    OPENROUTER_API_KEY,
+    OPENROUTER_APP_TITLE,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_HTTP_REFERER,
+    OPENROUTER_MODEL,
+    SYSTEM_PROMPT,
+)
 
 
-def _set_hf_token():
-    """Reads HF_TOKEN from env to enable authenticated HF Hub requests."""
-    token = HF_TOKEN.strip() or os.environ.get("HF_TOKEN", "").strip()
-    if token:
-        os.environ["HUGGING_FACE_HUB_TOKEN"] = token
-        print("[llm_handler] HF_TOKEN found — authenticated requests enabled.")
-    else:
-        print("[llm_handler] Warning: HF_TOKEN not set. "
-              "Set it with: export HF_TOKEN=your_token_here")
+def _resolve_api_key() -> str:
+    return (OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY", "") or "").strip()
 
 
-#  Prompt templates 
-def build_prompt(query: str, retrieved: list[dict]) -> str:
+def build_chat_messages(query: str, retrieved: list[dict]) -> list[dict[str, str]]:
+    """OpenRouter / chat-completions style messages with RAG context in the user turn."""
+    context = "\n\n".join(
+        [f"[Source: {r['metadata']['sheet']}]\n{r['document']}" for r in retrieved]
+    )
+    user_content = (
+        f"Context from bank knowledge base:\n{context}\n\nCustomer question: {query}"
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def load_llm() -> OpenAI:
     """
-    Builds the full prompt with retrieved context injected.
-    Uses ChatML format for TinyLlama (dev) and Llama-3 format for prod.
+    Returns an OpenAI-compatible client pointed at OpenRouter (no local LLM weights).
     """
-    context = "\n\n".join([
-        f"[Source: {r['metadata']['sheet']}]\n{r['document']}"
-        for r in retrieved
-    ])
-
-    if MODE == "dev":
-        return (
-            f"<|system|>\n{SYSTEM_PROMPT}</s>\n"
-            f"<|user|>\n"
-            f"Context from bank knowledge base:\n{context}\n\n"
-            f"Customer Question: {query}</s>\n"
-            f"<|assistant|>\n"
-        )
-    else:
-        
-        return (
-            f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
-            f"{SYSTEM_PROMPT}<|eot_id|>\n"
-            f"<|start_header_id|>user<|end_header_id|>\n"
-            f"Context from bank knowledge base:\n{context}\n\n"
-            f"Customer Question: {query}<|eot_id|>\n"
-            f"<|start_header_id|>assistant<|end_header_id|>\n"
+    key = _resolve_api_key()
+    if not key:
+        raise ValueError(
+            "OPENROUTER_API_KEY is not set. Add it to your environment or `.env` file."
         )
 
+    headers: dict[str, str] = {}
+    ref = (OPENROUTER_HTTP_REFERER or os.environ.get("OPENROUTER_HTTP_REFERER", "")).strip()
+    if ref:
+        headers["HTTP-Referer"] = ref
+    title = (
+        OPENROUTER_APP_TITLE
+        or os.environ.get("OPENROUTER_APP_TITLE", "")
+        or "Bank LLM Assistant"
+    ).strip()
+    if title:
+        headers["X-Title"] = title
 
-def extract_response(full_text: str) -> str:
-    """Strips the prompt prefix and returns only the model's reply."""
-    if MODE == "dev":
-        return full_text.split("<|assistant|>")[-1].strip()
-    else:
-        return full_text.split("<|start_header_id|>assistant<|end_header_id|>")[-1].strip()
+    print(f"\n[llm_handler] OpenRouter · model `{OPENROUTER_MODEL}`")
+    print(f"              Base URL: {OPENROUTER_BASE_URL}\n")
+
+    client_kw: dict = {
+        "api_key": key,
+        "base_url": OPENROUTER_BASE_URL.rstrip("/"),
+    }
+    if headers:
+        client_kw["default_headers"] = headers
+    return OpenAI(**client_kw)
 
 
-#  Model loading
-def load_llm():
+def generate_answer(query: str, retrieved: list[dict], llm_client: OpenAI) -> str:
     """
-    Loads the LLM tokenizer + model and returns a HuggingFace pipeline.
-    - Clears max_length from the model's generation config to fix the
-      'max_new_tokens vs max_length' conflict warning.
-    - Generation params are passed at inference time, not pipeline creation,
-      to avoid the GenerationConfig deprecation warning.
+    Calls OpenRouter chat completions and returns the assistant message text.
     """
-    _set_hf_token()
+    messages = build_chat_messages(query, retrieved)
+    try:
+        completion = llm_client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=messages,
+            max_tokens=MAX_NEW_TOKENS,
+            temperature=0,
+        )
+    except Exception as e:
+        print(f"[llm_handler] OpenRouter error: {e!r}")
+        return (
+            "I'm sorry, the language service is unavailable right now. "
+            "Please try again in a moment or contact the bank directly."
+        )
 
-    print(f"\n[llm_handler] Loading model : {LLM_MODEL}")
-    print(f"              Mode          : {MODE.upper()}")
-    print(f"              Device        : CPU")
-    print("              (First load may take a few minutes...)\n")
-
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
-
-    model = AutoModelForCausalLM.from_pretrained(
-        LLM_MODEL,
-        
-        dtype = torch.float32,
-        device_map  = "cpu"
-    )
-
-    if hasattr(model, "generation_config") and model.generation_config.max_length:
-        model.generation_config.max_length = None
-
-    llm_pipeline = pipeline(
-        "text-generation",
-        model     = model,
-        tokenizer = tokenizer,
-    )
-
-    print("[llm_handler] Model loaded successfully.")
-    return llm_pipeline
-
-
-# Inference
-def generate_answer(query: str, retrieved: list[dict], llm_pipeline) -> str:
-    """
-    Builds the prompt, runs inference with explicit generation params,
-    and returns only the assistant's response text.
-    """
-    prompt = build_prompt(query, retrieved)
-
-    output = llm_pipeline(
-        prompt,
-        max_new_tokens     = MAX_NEW_TOKENS,
-        do_sample          = False,
-        repetition_penalty = REPETITION_PENALTY,
-    )
-
-    return extract_response(output[0]["generated_text"])
+    choice = completion.choices[0].message
+    text = (choice.content or "").strip()
+    if not text:
+        return (
+            "I could not generate a reply. Please try rephrasing your question "
+            "or contact the bank directly."
+        )
+    return text

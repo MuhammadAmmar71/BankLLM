@@ -1,4 +1,6 @@
 import re
+from pathlib import Path
+
 import pandas as pd
 from config import DATASET_PATH
 
@@ -134,6 +136,49 @@ def parse_qa_from_sheet(df: pd.DataFrame, sheet_name: str) -> list[dict]:
         })
 
     return records
+
+
+def load_faq_csv(path: str, sheet_label: str = "CSV FAQ") -> list[dict]:
+    """
+    Load Q&A rows from a CSV. Recognizes columns named question/q/faq/prompt and
+    answer/a/response/reply (case-insensitive). If missing, uses the first two columns.
+    """
+    df = pd.read_csv(path)
+    col_map = {str(c).lower().strip(): c for c in df.columns}
+    q_col = None
+    a_col = None
+    for key in ("question", "q", "faq", "prompt"):
+        if key in col_map:
+            q_col = col_map[key]
+            break
+    for key in ("answer", "a", "response", "reply"):
+        if key in col_map:
+            a_col = col_map[key]
+            break
+    if q_col is None or a_col is None:
+        if len(df.columns) >= 2:
+            q_col, a_col = df.columns[0], df.columns[1]
+        else:
+            return []
+
+    records: list[dict] = []
+    for _, row in df.iterrows():
+        q = str(row[q_col]).strip() if pd.notna(row[q_col]) else ""
+        a = str(row[a_col]).strip() if pd.notna(row[a_col]) else ""
+        if not q or not a or q.lower() == "nan" or a.lower() == "nan":
+            continue
+        records.append({"question": q, "answer": a, "sheet": sheet_label})
+    return records
+
+
+def load_faq_file(path: str, upload_label: str = "Uploaded FAQ") -> list[dict]:
+    """Load FAQs from .csv or Excel (.xlsx / .xls) using the same rules as the core workbook."""
+    suffix = Path(path).suffix.lower()
+    if suffix == ".csv":
+        return load_faq_csv(path, sheet_label=upload_label)
+    if suffix in (".xlsx", ".xls"):
+        return load_dataset(path)
+    return []
 
 
 def load_dataset(path: str = DATASET_PATH) -> list[dict]:
